@@ -3,6 +3,8 @@ import pandas as pd
 import pdfplumber
 import re
 
+
+#The goal of this code is to extract outcome reports from survery reports from any year
 rows = []
 reports = "GraduationSurveyReports"
 
@@ -10,6 +12,18 @@ def clean(x):
     if x is None:
         return ""
     return str(x).replace("\n", " ").strip()
+    
+def find_count_anywhere(row):
+    for cell in row:
+        if is_count(cell):
+            return clean(cell)
+    return ""
+
+def find_percent_anywhere(row):
+    for cell in row:
+        if is_percent(cell):
+            return clean(cell)
+    return ""
     
 def is_count(x):
     x = clean(x).replace(",", "")
@@ -33,6 +47,20 @@ def is_percent(x):
     x = clean(x)
     return bool(re.match(r"^\d+(\.\d+)?%$", x))
 
+def looks_like_label(s):
+    s = clean(s)
+    if not s:
+        return False
+    if is_count(s) or is_percent(s):
+        return False
+    if s.lower() in {"outcome", "#", "%"}:
+        return False
+    return True
+
+def find_label_anywhere(row):
+    labels = [clean(c) for c in row if looks_like_label(c)]
+    return max(labels, key=len) if labels else ""
+
 for file in os.listdir(reports):
     if file.endswith(".pdf"):
         new_path = os.path.join(reports, file)
@@ -44,7 +72,8 @@ for file in os.listdir(reports):
                         continue
                     header_row_idx = None
                     outcome_idx = count_idx = percent_idx = None
-                    for i, r in enumerate(table[:12]):  # search near top
+                     # search near top
+                    for i, r in enumerate(table[:10]):
                         if not r:
                             continue
                         r_clean = [clean(c).lower() for c in r]
@@ -56,7 +85,8 @@ for file in os.listdir(reports):
                             percent_idx = find_idx(r, "%")
                             break
                     if header_row_idx is None or outcome_idx is None or count_idx is None or percent_idx is None:
-                        continue  # not the Outcomes table (or header not parseable)
+                        # not the Outcomes table (or header not parseable)
+                        continue  
                     pending_outcome = ""
 
                     for r in table[header_row_idx + 1:]:
@@ -70,27 +100,33 @@ for file in os.listdir(reports):
                         outcome = clean(r[outcome_idx])
                         count = clean(r[count_idx])
                         percent = clean(r[percent_idx])
+                        
+                        if not is_count(count):
+                            count = find_count_anywhere(r)
+                        if not is_percent(percent):
+                            percent = find_percent_anywhere(r)
+                            
+                        if outcome == "":
+                            outcome = find_label_anywhere(r)
 
                         # Skip obvious junk rows
-                        if outcome.lower() in {"outcome", "total", "grand total"}:
+                        if outcome.lower() in {"outcome"}:
                             continue
 
-                        # 3) Handle wrapped outcomes:
-                        # If outcome text exists but count/percent aren't valid yet, treat as a continuation line
-                        if outcome and (not is_count(count) or not is_percent(percent)):
+
+                        # Only treat as wrapped text if there are STILL no numbers anywhere
+                        if outcome and (count == "" and percent == ""):
                             pending_outcome = (pending_outcome + " " + outcome).strip()
                             continue
 
-                        # If this row has the numeric pieces and we had a pending wrapped outcome, merge them
+                        # If this row has the number pieces and we had a pending wrapped outcome,then we merge them
                         if pending_outcome:
                             if outcome:
                                 outcome = (pending_outcome + " " + outcome).strip()
                             else:
                                 outcome = pending_outcome
                             pending_outcome = ""
-
-                        # Keep only real data rows with valid count + percent
-                        if not is_count(count) or not is_percent(percent):
+                        if not is_count(count) or outcome == "":
                             continue
 
                         rows.append({
