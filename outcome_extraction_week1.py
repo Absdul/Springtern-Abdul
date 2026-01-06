@@ -61,6 +61,33 @@ def find_label_anywhere(row):
     labels = [clean(c) for c in row if looks_like_label(c)]
     return max(labels, key=len) if labels else ""
 
+def get_page_title(page):
+    text = page.extract_text() or ""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    # look near the top only
+    bad_starts = ("SURVEY RESPONSE RATE", "KNOWLEDGE RATE", "TOTAL PLACEMENT", "REPORTED OUTCOMES")
+    for ln in lines[:20]:
+        up = ln.upper()
+
+        # skip obvious non-title lines
+        if any(up.startswith(b) for b in bad_starts):
+            continue
+
+        # prefer UMD overall titles
+        if "UNIVERSITY OF MARYLAND" in up:
+            return ln
+
+        # otherwise, pick a "heading-like" line: mostly uppercase letters
+        letters = [ch for ch in ln if ch.isalpha()]
+        if not letters:
+            continue
+        uppercase_ratio = sum(ch.isupper() for ch in letters) / len(letters)
+        if uppercase_ratio >= 0.85:
+            return ln
+
+    return ""
+
 for file in os.listdir(reports):
     if file.endswith(".pdf"):
         new_path = os.path.join(reports, file)
@@ -87,6 +114,7 @@ for file in os.listdir(reports):
                     if header_row_idx is None or outcome_idx is None or count_idx is None or percent_idx is None:
                         # not the Outcomes table (or header not parseable)
                         continue  
+                    page_title = get_page_title(page)
                     pending_outcome = ""
 
                     for r in table[header_row_idx + 1:]:
@@ -131,6 +159,7 @@ for file in os.listdir(reports):
 
                         rows.append({
                             "pdf": file,
+                            "title": page_title,
                             "outcome": outcome,
                             "count": count,
                             "percent": percent
