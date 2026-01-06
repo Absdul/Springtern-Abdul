@@ -1,10 +1,8 @@
-import os 
+import os
+import re
 import pandas as pd
 import pdfplumber
-import re
 
-
-#The goal of this code is to extract outcome reports from survery reports from any year
 rows = []
 reports = "GraduationSurveyReports"
 
@@ -12,36 +10,10 @@ def clean(x):
     if x is None:
         return ""
     return str(x).replace("\n", " ").strip()
-    
-def find_count_anywhere(row):
-    for cell in row:
-        if is_count(cell):
-            return clean(cell)
-    return ""
 
-def find_percent_anywhere(row):
-    for cell in row:
-        if is_percent(cell):
-            return clean(cell)
-    return ""
-    
 def is_count(x):
     x = clean(x).replace(",", "")
     return x.isdigit()
-
-def find_idx(header_row, target):
-
-    for i, cell in enumerate(header_row):
-        c = clean(cell).lower()
-        if not c:
-            continue
-        if target == "outcome" and "outcome" in c:
-            return i
-        if target == "#" and c == "#":
-            return i
-        if target == "%" and c == "%":
-            return i
-    return None
 
 def is_percent(x):
     x = clean(x)
@@ -53,6 +25,7 @@ def looks_like_label(s):
         return False
     if is_count(s) or is_percent(s):
         return False
+    # ignore common header tokens
     if s.lower() in {"outcome", "#", "%"}:
         return False
     return True
@@ -61,109 +34,248 @@ def find_label_anywhere(row):
     labels = [clean(c) for c in row if looks_like_label(c)]
     return max(labels, key=len) if labels else ""
 
+def find_count_anywhere(row):
+    for cell in row:
+        if is_count(cell):
+            return clean(cell)
+    return ""
+
+def find_percent_anywhere(row):
+    for cell in row:
+        if is_percent(cell):
+            return clean(cell)
+    return ""
+
+def title_line_candidate(line: str) -> bool:
+    up = line.upper()
+    if not line.strip():
+        return False
+    # skip obvious non-titles
+    bad_starts = (
+        "SURVEY RESPONSE RATE",
+        "KNOWLEDGE RATE",
+        "TOTAL PLACEMENT",
+        "REPORTED OUTCOMES",
+        "GRADUATE OUTCOMES",
+        "AS OF ",
+    )
+    if any(up.startswith(b) for b in bad_starts):
+        return False
+    # must have letters
+    return any(ch.isalpha() for ch in line)
+
 def get_page_title(page):
     text = page.extract_text() or ""
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-    # look near the top only
-    bad_starts = ("SURVEY RESPONSE RATE", "KNOWLEDGE RATE", "TOTAL PLACEMENT", "REPORTED OUTCOMES")
-    for ln in lines[:20]:
-        up = ln.upper()
+    # Lines we never want to treat as "title"
+    bad_contains = (
+        "survey response rate",
+        "knowledge rate",
+        "total placement",
+        "reported outcomes",
+        "graduate outcomes",
+        "as of",
+        "data from",
+        "had been collected",
+        "via the survey",
+        "between",  # <-- this is the big one causing your issue
+    )
 
-        # skip obvious non-title lines
-        if any(up.startswith(b) for b in bad_starts):
+    def is_good_title_line(ln: str) -> bool:
+        low = ln.lower()
+
+        # reject body/metric lines
+        if any(b in low for b in bad_contains):
+            return False
+
+        # reject lines with obvious table symbols or percents
+        if "%" in ln or "#" in ln:
+            return False
+
+        # reject long sentences (usually paragraph text)
+        if len(ln) > 80:
+            return False
+
+        # reject lines with lots of digits (also usually body)
+        if sum(ch.isdigit() for ch in ln) >= 2:
+            return False
+
+        # must have letters
+        return any(ch.isalpha() for ch in ln)
+
+    # Find the first good title candidate near the top
+    start_idx = None
+    for i, ln in enumerate(lines[:20]):
+        if is_good_title_line(ln):
+            start_idx = i
+            break
+
+    if start_idx is None:
+        return ""
+
+    # Join 1–3 continuation lines if they also look like title lines
+    title_lines = [lines[start_idx]]
+    for j in range(start_idx + 1, min(start_idx + 4, len(lines))):
+        if is_good_title_line(lines[j]) and len(lines[j]) <= 60:
+            title_lines.append(lines[j])
+        else:
+            break
+
+    return " ".join(title_lines)
+
+def is_outcomes_table(table):
+    """
+    Identify the right table without relying on a header row.
+    We score tables by how many rows look like: label + count + percent.
+    Also require it contains outcome-type keywords to avoid grabbing
+    unrelated % tables (like continuing education breakdowns).
+    """
+    score = 0
+    labels = []
+
+    for r in table[:15]:
+        if not r:
+            continue
+        lab = find_label_anywhere(r).lower()
+        cnt = find_count_anywhere(r)
+        pct = find_percent_anywhere(r)
+
+        if lab:
+            labels.append(lab)
+        if lab and cnt and pct:
+            score += 1
+
+    # must have several real rows
+    if score < 3:
+        return False, score
+
+    # outcome table usually contains at least one of these concepts
+    if not any(("employed" in l or "unplaced" in l or "unresolved" in l) for l in labels):
+        return False, score
+
+    return True, score
+
+def parse_outcomes_table(table):
+    """
+    Parse rows while fixing wrapped labels.
+    Key fix: if a row has label text but NO numbers, append it to the previous outcome.
+    """
+    out = []
+    last = None
+    pending_label = ""
+
+    for r in table:
+        if not r:
             continue
 
-        # prefer UMD overall titles
-        if "UNIVERSITY OF MARYLAND" in up:
-            return ln
+        label = find_label_anywhere(r)
+        cnt = find_count_anywhere(r)
+        pct = find_percent_anywhere(r)
 
-        # otherwise, pick a "heading-like" line: mostly uppercase letters
-        letters = [ch for ch in ln if ch.isalpha()]
-        if not letters:
+        # 1) Continuation line: label exists, but no numbers
+        if label and not cnt and not pct:
+            if last is not None:
+                last["outcome"] = (last["outcome"] + " " + label).strip()
+            else:
+                pending_label = (pending_label + " " + label).strip()
             continue
-        uppercase_ratio = sum(ch.isupper() for ch in letters) / len(letters)
-        if uppercase_ratio >= 0.85:
-            return ln
 
-    return ""
+        # 2) If label is missing but we have pending text, use it
+        if not label and pending_label:
+            label = pending_label
+            pending_label = ""
+
+        # 3) If both exist, merge pending + current label
+        if label and pending_label:
+            label = (pending_label + " " + label).strip()
+            pending_label = ""
+
+        if not label:
+            continue
+
+        # skip header-ish rows
+        if label.lower() == "outcome":
+            continue
+
+        # 4) Keep rows with a count. Percent is optional (Not Seeking often has no %)
+        if cnt and (pct or label.lower().startswith("not seeking")):
+            row = {"outcome": label, "count": cnt, "percent": pct}
+            out.append(row)
+            last = row
+        else:
+            # if it's text but still no count, treat as pending
+            if label and not cnt:
+                pending_label = (pending_label + " " + label).strip()
+
+    return out
+
+def extract_total_and_not_seeking_from_text(page_text):
+    """
+    Newer PDFs sometimes don't include TOTAL / Not Seeking inside extract_tables().
+    Pull them from the raw extracted text as a fallback.
+    """
+    found = []
+
+    # TOTAL 1072 100.0%
+    m_total = re.search(r"\bTOTAL\b\s+([\d,]+)\s+(\d+(\.\d+)?%)", page_text, re.IGNORECASE)
+    if m_total:
+        found.append({"outcome": "TOTAL", "count": m_total.group(1), "percent": m_total.group(2)})
+
+    # Not Seeking 10   (no percent)
+    m_ns = re.search(r"\bNot\s+Seeking\b\s+([\d,]+)\b", page_text, re.IGNORECASE)
+    if m_ns:
+        found.append({"outcome": "Not Seeking", "count": m_ns.group(1), "percent": ""})
+
+    return found
 
 for file in os.listdir(reports):
-    if file.endswith(".pdf"):
-        new_path = os.path.join(reports, file)
-        with pdfplumber.open(new_path) as pdf:
-            for page in pdf.pages: 
-                tables = page.extract_tables() or []
-                for table in tables:
-                    if not table or not table[0]:
-                        continue
-                    header_row_idx = None
-                    outcome_idx = count_idx = percent_idx = None
-                     # search near top
-                    for i, r in enumerate(table[:10]):
-                        if not r:
-                            continue
-                        r_clean = [clean(c).lower() for c in r]
-                        
-                        if any("outcome" in c for c in r_clean) and "#" in r_clean and "%" in r_clean:
-                            header_row_idx = i
-                            outcome_idx = find_idx(r, "outcome")
-                            count_idx = find_idx(r, "#")
-                            percent_idx = find_idx(r, "%")
-                            break
-                    if header_row_idx is None or outcome_idx is None or count_idx is None or percent_idx is None:
-                        # not the Outcomes table (or header not parseable)
-                        continue  
-                    page_title = get_page_title(page)
-                    pending_outcome = ""
+    if not file.endswith(".pdf"):
+        continue
 
-                    for r in table[header_row_idx + 1:]:
-                        if not r:
-                            continue
+    new_path = os.path.join(reports, file)
 
-                        # ensure indexes exist
-                        if max(outcome_idx, count_idx, percent_idx) >= len(r):
-                            continue
+    with pdfplumber.open(new_path) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables() or []
+            if not tables:
+                continue
 
-                        outcome = clean(r[outcome_idx])
-                        count = clean(r[count_idx])
-                        percent = clean(r[percent_idx])
-                        
-                        if not is_count(count):
-                            count = find_count_anywhere(r)
-                        if not is_percent(percent):
-                            percent = find_percent_anywhere(r)
-                            
-                        if outcome == "":
-                            outcome = find_label_anywhere(r)
+            page_title = get_page_title(page)
+            page_text = page.extract_text() or ""
 
-                        # Skip obvious junk rows
-                        if outcome.lower() in {"outcome"}:
-                            continue
+            # pick best matching outcomes table on this page
+            candidates = []
+            for t in tables:
+                if not t:
+                    continue
+                ok, score = is_outcomes_table(t)
+                if ok:
+                    candidates.append((score, t))
 
+            if not candidates:
+                continue
 
-                        # Only treat as wrapped text if there are STILL no numbers anywhere
-                        if outcome and (count == "" and percent == ""):
-                            pending_outcome = (pending_outcome + " " + outcome).strip()
-                            continue
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            best_table = candidates[0][1]
 
-                        # If this row has the number pieces and we had a pending wrapped outcome,then we merge them
-                        if pending_outcome:
-                            if outcome:
-                                outcome = (pending_outcome + " " + outcome).strip()
-                            else:
-                                outcome = pending_outcome
-                            pending_outcome = ""
-                        if not is_count(count) or outcome == "":
-                            continue
+            parsed = parse_outcomes_table(best_table)
 
-                        rows.append({
-                            "pdf": file,
-                            "title": page_title,
-                            "outcome": outcome,
-                            "count": count,
-                            "percent": percent
-                        })
+            # fallback for TOTAL / Not Seeking if missing
+            existing_outcomes = {p["outcome"].lower() for p in parsed}
+            for extra in extract_total_and_not_seeking_from_text(page_text):
+                if extra["outcome"].lower() not in existing_outcomes:
+                    parsed.append(extra)
+
+            for item in parsed:
+                rows.append({
+                    "pdf": file,
+                    "title": page_title,
+                    "outcome": item["outcome"],
+                    "count": item["count"],
+                    "percent": item["percent"],
+                })
 
 df = pd.DataFrame(rows).drop_duplicates()
 df.to_csv("outcome_week1.csv", index=False)
+
