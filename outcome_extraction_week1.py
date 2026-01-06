@@ -16,8 +16,8 @@ def is_count(x):
     return x.isdigit()
 
 def is_percent(x):
-    x = clean(x)
-    return bool(re.match(r"^\d+(\.\d+)?%$", x))
+    x = clean(x).replace(" ", "")
+    return bool(re.match(r"^<?\d+(\.\d+)?%$", x))
 
 def looks_like_label(s):
     s = clean(s)
@@ -25,9 +25,16 @@ def looks_like_label(s):
         return False
     if is_count(s) or is_percent(s):
         return False
-    # ignore common header tokens
-    if s.lower() in {"outcome", "#", "%"}:
+
+    low = s.lower()
+
+    # ignores common header tokens
+    if low in {"outcome", "#", "%"}:
         return False
+
+    if "reported outcomes" in low or "graduate outcomes" in low:
+        return False
+
     return True
 
 def find_label_anywhere(row):
@@ -276,6 +283,8 @@ for file in os.listdir(reports):
                     "percent": item["percent"],
                 })
 
-df = pd.DataFrame(rows).drop_duplicates()
+df = pd.DataFrame(rows)
+df['outcome'] = df['outcome'].str.replace('Grand Total', 'TOTAL')
+df = df.drop_duplicates()
 df.to_csv("outcome_week1.csv", index=False)
 
