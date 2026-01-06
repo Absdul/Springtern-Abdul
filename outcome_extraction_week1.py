@@ -79,7 +79,7 @@ def get_page_title(page):
         "data from",
         "had been collected",
         "via the survey",
-        "between",  # <-- this is the big one causing your issue
+        "between",
     )
 
     def is_good_title_line(ln: str) -> bool:
