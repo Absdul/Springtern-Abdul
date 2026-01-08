@@ -2,6 +2,7 @@ import os
 import re
 import pandas as pd
 import pdfplumber
+import numpy as np
 
 rows = []
 reports = "GraduationSurveyReports"
@@ -28,7 +29,6 @@ def looks_like_label(s):
 
     low = s.lower()
 
-    # ignores common header tokens
     if low in {"outcome", "#", "%"}:
         return False
 
@@ -57,7 +57,7 @@ def title_line_candidate(line: str) -> bool:
     up = line.upper()
     if not line.strip():
         return False
-    # skip obvious non-titles
+
     bad_starts = (
         "SURVEY RESPONSE RATE",
         "KNOWLEDGE RATE",
@@ -68,14 +68,13 @@ def title_line_candidate(line: str) -> bool:
     )
     if any(up.startswith(b) for b in bad_starts):
         return False
-    # must have letters
+
     return any(ch.isalpha() for ch in line)
 
 def get_page_title(page):
     text = page.extract_text() or ""
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-    # Lines we never want to treat as "title"
     bad_contains = (
         "survey response rate",
         "knowledge rate",
@@ -92,28 +91,22 @@ def get_page_title(page):
     def is_good_title_line(ln: str) -> bool:
         low = ln.lower()
 
-        # reject body/metric lines
         if any(b in low for b in bad_contains):
             return False
 
-        # reject lines with obvious table symbols or percents
         if "%" in ln or "#" in ln:
             return False
 
-        # reject long sentences (usually paragraph text)
         if len(ln) > 80:
             return False
 
-        # reject lines with lots of digits (also usually body)
         if sum(ch.isdigit() for ch in ln) >= 2:
             return False
 
-        # must have letters
         return any(ch.isalpha() for ch in ln)
 
-    # Find the first good title candidate near the top
     start_idx = None
-    for i, ln in enumerate(lines[:20]):
+    for i, ln in enumerate(lines[:10]):
         if is_good_title_line(ln):
             start_idx = i
             break
@@ -121,7 +114,6 @@ def get_page_title(page):
     if start_idx is None:
         return ""
 
-    # Join 1–3 continuation lines if they also look like title lines
     title_lines = [lines[start_idx]]
     for j in range(start_idx + 1, min(start_idx + 4, len(lines))):
         if is_good_title_line(lines[j]) and len(lines[j]) <= 60:
@@ -132,12 +124,6 @@ def get_page_title(page):
     return " ".join(title_lines)
 
 def is_outcomes_table(table):
-    """
-    Identify the right table without relying on a header row.
-    We score tables by how many rows look like: label + count + percent.
-    Also require it contains outcome-type keywords to avoid grabbing
-    unrelated % tables (like continuing education breakdowns).
-    """
     score = 0
     labels = []
 
@@ -153,21 +139,15 @@ def is_outcomes_table(table):
         if lab and cnt and pct:
             score += 1
 
-    # must have several real rows
     if score < 3:
         return False, score
 
-    # outcome table usually contains at least one of these concepts
     if not any(("employed" in l or "unplaced" in l or "unresolved" in l) for l in labels):
         return False, score
 
     return True, score
 
 def parse_outcomes_table(table):
-    """
-    Parse rows while fixing wrapped labels.
-    Key fix: if a row has label text but NO numbers, append it to the previous outcome.
-    """
     out = []
     last = None
     pending_label = ""
@@ -177,10 +157,23 @@ def parse_outcomes_table(table):
             continue
 
         label = find_label_anywhere(r)
+        low = label.lower()
+        junk_phrases = [
+            "reported outcomes of graduates",
+            "reported outcomes of",
+            "graduate outcomes",
+        ]
+        for jp in junk_phrases:
+            if jp in low:
+                label = re.sub(jp, "", label, flags=re.IGNORECASE).strip()
+                low = label.lower()
+
+        label = re.sub(r"\b20\d{2}\s+graduates\b", "", label, flags=re.IGNORECASE).strip()
+
+        label = re.sub(r"\s{2,}", " ", label).strip()
         cnt = find_count_anywhere(r)
         pct = find_percent_anywhere(r)
 
-        # 1) Continuation line: label exists, but no numbers
         if label and not cnt and not pct:
             if last is not None:
                 last["outcome"] = (last["outcome"] + " " + label).strip()
@@ -188,12 +181,10 @@ def parse_outcomes_table(table):
                 pending_label = (pending_label + " " + label).strip()
             continue
 
-        # 2) If label is missing but we have pending text, use it
         if not label and pending_label:
             label = pending_label
             pending_label = ""
 
-        # 3) If both exist, merge pending + current label
         if label and pending_label:
             label = (pending_label + " " + label).strip()
             pending_label = ""
@@ -201,40 +192,82 @@ def parse_outcomes_table(table):
         if not label:
             continue
 
-        # skip header-ish rows
         if label.lower() == "outcome":
             continue
 
-        # 4) Keep rows with a count. Percent is optional (Not Seeking often has no %)
-        if cnt and (pct or label.lower().startswith("not seeking")):
+        is_total = label.strip().lower() == "total"
+        is_not_seeking = label.strip().lower().startswith("not seeking")
+
+        if cnt and (pct or is_total or is_not_seeking):
             row = {"outcome": label, "count": cnt, "percent": pct}
             out.append(row)
             last = row
         else:
-            # if it's text but still no count, treat as pending
             if label and not cnt:
                 pending_label = (pending_label + " " + label).strip()
 
     return out
 
 def extract_total_and_not_seeking_from_text(page_text):
-    """
-    Newer PDFs sometimes don't include TOTAL / Not Seeking inside extract_tables().
-    Pull them from the raw extracted text as a fallback.
-    """
     found = []
 
-    # TOTAL 1072 100.0%
-    m_total = re.search(r"\bTOTAL\b\s+([\d,]+)\s+(\d+(\.\d+)?%)", page_text, re.IGNORECASE)
+    m_total = re.search(r"\bTOTAL\b\s+([\d,]+)(?:\s+(\d+(\.\d+)?%))?", page_text, re.IGNORECASE)
     if m_total:
-        found.append({"outcome": "TOTAL", "count": m_total.group(1), "percent": m_total.group(2)})
+        found.append({"outcome": "TOTAL", "count": m_total.group(1), "percent": m_total.group(2) or ""})
 
-    # Not Seeking 10   (no percent)
     m_ns = re.search(r"\bNot\s+Seeking\b\s+([\d,]+)\b", page_text, re.IGNORECASE)
     if m_ns:
         found.append({"outcome": "Not Seeking", "count": m_ns.group(1), "percent": ""})
 
     return found
+
+def outcome_key(s: str):
+    s = (s or "").lower()
+
+    if "employed" in s and "ft" in s: return "Employed FT"
+    if "employed" in s and "pt" in s: return "Employed PT"
+    if "continuing" in s and "education" in s: return "Continuing Edu"
+    if "volunteer" in s or "service program" in s: return "Volunteering"
+    if "military" in s: return "Military"
+    if "business" in s: return "Business"
+    if "unplaced" in s: return "Unplaced"
+    if "unresolved" in s: return "Unresolved"
+    if re.search(r"\btotal\b", s): return "Total"
+    if "not seeking" in s: return "Not Seeking"
+    return None
+
+def pct_to_float(x):
+    x = str(x).strip()
+
+    if not x:
+        return np.nan
+
+    if x.startswith("<") and x.endswith("%"):
+        return 1.0
+
+    try:
+        return float(x[:-1]) 
+    except ValueError:
+        return np.nan
+    
+def normalize_unit(u: str) -> str:
+    u = str(u or "").strip()
+    u = re.sub(r"\s+", " ", u)        
+    u = u.replace("–", "-").replace("—", "-")
+
+    low = u.lower()
+
+    if "university of maryland" in low and (
+        "university-wide" in low
+        or "university wide" in low
+        or "overall" in low
+        or "graduate survey report" in low):
+        return "University-wide"
+
+    if low == "university of maryland":
+        return "University-wide"
+
+    return u
 
 for file in os.listdir(reports):
     if not file.endswith(".pdf"):
@@ -251,7 +284,6 @@ for file in os.listdir(reports):
             page_title = get_page_title(page)
             page_text = page.extract_text() or ""
 
-            # pick best matching outcomes table on this page
             candidates = []
             for t in tables:
                 if not t:
@@ -268,7 +300,6 @@ for file in os.listdir(reports):
 
             parsed = parse_outcomes_table(best_table)
 
-            # fallback for TOTAL / Not Seeking if missing
             existing_outcomes = {p["outcome"].lower() for p in parsed}
             for extra in extract_total_and_not_seeking_from_text(page_text):
                 if extra["outcome"].lower() not in existing_outcomes:
@@ -284,7 +315,85 @@ for file in os.listdir(reports):
                 })
 
 df = pd.DataFrame(rows)
-df['outcome'] = df['outcome'].str.replace('Grand Total', 'TOTAL')
-df = df.drop_duplicates()
-df.to_csv("outcome_week1.csv", index=False)
+df["Year"] = df["pdf"].str.extract(r"(20\d{2})").astype("Int64")
 
+df = df.rename(columns={"title": "Unit"})
+
+df["count"] = df["count"].astype(str).str.replace(",", "", regex=False)
+df.loc[~df["count"].str.fullmatch(r"\d+"), "count"] = np.nan
+df["count"] = df["count"].astype("Int64")
+
+df["percent"] = df["percent"].fillna("").astype(str).str.replace(" ", "", regex=False)
+
+df["Outcome"] = df["outcome"].apply(outcome_key)
+df = df[df["Outcome"].notna()].copy()
+
+n = df.pivot_table(index=["Unit", "Year"], columns="Outcome", values="count", aggfunc="first")
+p = df.pivot_table(index=["Unit", "Year"], columns="Outcome", values="percent", aggfunc="first")
+
+out = pd.concat([n.add_suffix(" N"), p.add_suffix(" %")], axis=1).reset_index()
+
+unplaced = out.get("Unplaced %", "").apply(pct_to_float) if "Unplaced %" in out else np.nan
+unresolved = out.get("Unresolved %", "").apply(pct_to_float) if "Unresolved %" in out else np.nan
+if "Unplaced %" in out and "Unresolved %" in out:
+    out["Placement Rate %"] = (100 - unplaced - unresolved).round(1).astype(str) + "%"
+
+col_order = [
+    "Unit","Year",
+    "Employed FT N","Employed FT %",
+    "Employed PT N","Employed PT %",
+    "Continuing Edu N","Continuing Edu %",
+    "Volunteering N","Volunteering %",
+    "Military N","Military %",
+    "Business N","Business %",
+    "Unplaced N","Unplaced %",
+    "Unresolved N","Unresolved %",
+    "Total N",
+    "Not Seeking N",
+    "Placement Rate %",
+]
+out = out[[c for c in col_order if c in out.columns]]
+
+out["Unit"] = out["Unit"].astype(str).str.strip()
+out["Unit"] = out["Unit"].str.replace(r"\s+", " ", regex=True)  
+out["Unit"] = out["Unit"].str.replace(" ,", ",", regex=False) 
+
+out["Unit"] = out["Unit"].str.replace(
+    r"(?i)^university of maryland\s*-\s*overall$",
+    "University-wide",
+    regex=True
+)
+
+unit_order = [
+    "University-wide",
+    "College of Agriculture and Natural Resources",
+    "College of Arts and Humanities",
+    "College of Behavioral and Social Sciences",
+    "College of Computer, Mathematical, and Natural Sciences",
+    "College of Education",
+    "College of Information",
+    "The A. James Clark School of Engineering",
+    "Philip Merrill College of Journalism",
+    "School of Architecture, Planning, and Preservation",
+    "School of Public Health",
+    "School of Public Policy",
+    "The Robert H. Smith School of Business",
+    "College Park Scholars",
+    "Honors College",
+    "Letters and Sciences",
+    "Undergraduate Studies",
+]
+out["Unit"] = out["Unit"].apply(normalize_unit)
+out["Unit_cat"] = pd.Categorical(out["Unit"], categories=unit_order, ordered=True)
+
+out = (
+    out.sort_values(
+        ["Year", "Unit_cat", "Unit"], 
+        ascending=[True, True, True],
+        na_position="last"
+    )
+    .drop(columns=["Unit_cat"])
+    .reset_index(drop=True)
+)
+
+out.to_csv("outcome_week1.csv", index=False)
